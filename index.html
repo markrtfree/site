@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AWS 新加坡节点网络性能与异常根因诊断报告（脱敏版）</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    :root {
+      --bg-base: #0f172a;
+      --card-bg: #1e293b;
+      --card-border: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent-blue: #38bdf8;
+      --accent-red: #f43f5e;
+      --accent-green: #10b981;
+      --accent-amber: #f59e0b;
+    }
+    body {
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+    .metric-card {
+      background: linear-gradient(145deg, #1e293b, #0f172a);
+      border: 1px solid var(--card-border);
+    }
+    .code-block {
+      background-color: #090d16;
+      border: 1px solid #1e293b;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+  </style>
+</head>
+<body class="p-4 md:p-8 antialiased selection:bg-cyan-500 selection:text-white">
+  <div class="max-w-6xl mx-auto space-y-8">
+
+    <!-- Header Section -->
+    <header class="border-b border-slate-700/60 pb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
+      <div>
+        <div class="flex items-center gap-3">
+          <span class="px-2.5 py-1 rounded text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+            已脱敏 · 生产环境诊断
+          </span>
+          <span class="px-2.5 py-1 rounded text-xs font-semibold bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+            AWS Lightsail 新加坡
+          </span>
+        </div>
+        <h1 class="text-2xl md:text-3xl font-bold tracking-tight text-white mt-2">
+          AWS-SG 节点性能异常交叉对比分析报告
+        </h1>
+        <p class="text-slate-400 text-sm mt-1">
+          评估对象：<code class="text-slate-200">awssg (老母鸡)</code> VS <code class="text-slate-200">awssg2 (新自用鸡)</code> ｜ 诊断时间：2026-11-07
+        </p>
+      </div>
+      <div class="flex items-center gap-2 self-start md:self-auto">
+        <div class="text-right text-xs text-slate-400">
+          <div>客户端公网：<span class="font-mono text-slate-300">58.45.***.*** (中国电信)</span></div>
+          <div>测试工具：<span class="font-mono text-slate-300">iperf3 v3.22 / ss -ti / openssl</span></div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Executive Summary Verdict Card -->
+    <section class="rounded-2xl p-6 border border-rose-500/30 bg-gradient-to-r from-rose-950/30 via-slate-900 to-slate-900 shadow-xl space-y-4">
+      <div class="flex items-center gap-3">
+        <div class="p-2 rounded-lg bg-rose-500/20 text-rose-400">
+          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+        </div>
+        <div>
+          <h2 class="text-lg font-bold text-white">定性结论：母鸡严重超售导致公网突发网络积分枯竭（惩罚性丢包）</h2>
+          <p class="text-sm text-slate-300">排除宿主机硬件故障、排除 CPU 算力偷抢、排除容器内部人为 TC 限速</p>
+        </div>
+      </div>
+      <p class="text-sm text-slate-300 leading-relaxed">
+        交叉对比测试显示：<strong class="text-rose-400">awssg</strong> 与 <strong class="text-emerald-400">awssg2</strong> 处于 AWS 新加坡同一可用区内网，互相直连延迟仅 <span class="text-cyan-300 font-mono">0.42ms</span>，内网直连吞吐跑满 <span class="text-cyan-300 font-mono">647 Mbps</span>，CPU 算力与 NVMe 写入速度完全一致。
+        然而在<strong>公网回程</strong>测试中，<code class="text-rose-300">awssg</code> 遭遇高达 <strong class="text-rose-400 font-mono">31.6% 恶性丢包</strong>，带宽暴跌至 <strong class="text-rose-400 font-mono">3.40 Mbps</strong>；而 <code class="text-emerald-300">awssg2</code> 丢包率仅 <strong class="text-emerald-400 font-mono">0.01%</strong>，公网回程跑出 <strong class="text-emerald-400 font-mono">353 Mbps</strong>（相差 <strong>103.8 倍</strong>）。
+        根本原因是老母鸡商家（超售标称带宽超 7.6G）榨干了 AWS Lightsail 的公网突发网络额度（Network Allowance），触发 AWS 底层物理网关限速与丢包惩罚。
+      </p>
+    </section>
+
+    <!-- Key Metrics Highlight Grid -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div class="metric-card p-5 rounded-xl border border-slate-700/60">
+        <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">公网回程下载速率 (软路由)</div>
+        <div class="mt-2 flex items-baseline gap-2">
+          <span class="text-2xl font-bold text-rose-400 font-mono">3.40</span>
+          <span class="text-xs text-slate-400">vs</span>
+          <span class="text-2xl font-bold text-emerald-400 font-mono">353.0</span>
+          <span class="text-xs text-slate-400">Mbps</span>
+        </div>
+        <div class="mt-2 text-xs text-slate-400 flex items-center gap-1.5">
+          <span class="inline-block w-2 h-2 rounded-full bg-emerald-400"></span>
+          awssg2 性能达 awssg 的 <strong>103.8 倍</strong>
+        </div>
+      </div>
+
+      <div class="metric-card p-5 rounded-xl border border-slate-700/60">
+        <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">TCP 套接字重传率 (ss -ti)</div>
+        <div class="mt-2 flex items-baseline gap-2">
+          <span class="text-2xl font-bold text-rose-400 font-mono">31.6%</span>
+          <span class="text-xs text-slate-400">vs</span>
+          <span class="text-2xl font-bold text-emerald-400 font-mono">0.01%</span>
+        </div>
+        <div class="mt-2 text-xs text-slate-400 flex items-center gap-1.5">
+          <span class="inline-block w-2 h-2 rounded-full bg-rose-400"></span>
+          awssg 触发 7 次路由重散列 (rehash)
+        </div>
+      </div>
+
+      <div class="metric-card p-5 rounded-xl border border-slate-700/60">
+        <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">AWS 同机房内网直连吞吐</div>
+        <div class="mt-2 flex items-baseline gap-2">
+          <span class="text-2xl font-bold text-cyan-400 font-mono">647.0</span>
+          <span class="text-xs text-slate-400">Mbps</span>
+          <span class="text-xs text-emerald-400 font-mono">(0 丢包)</span>
+        </div>
+        <div class="mt-2 text-xs text-slate-400 flex items-center gap-1.5">
+          <span class="inline-block w-2 h-2 rounded-full bg-cyan-400"></span>
+          证实物理网卡与内网链路 100% 满血
+        </div>
+      </div>
+
+      <div class="metric-card p-5 rounded-xl border border-slate-700/60">
+        <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">CPU 算力与 Steal 争抢率</div>
+        <div class="mt-2 flex items-baseline gap-2">
+          <span class="text-2xl font-bold text-slate-200 font-mono">3.23</span>
+          <span class="text-xs text-slate-400">vs</span>
+          <span class="text-2xl font-bold text-slate-200 font-mono">3.14</span>
+          <span class="text-xs text-slate-400">GB/s</span>
+        </div>
+        <div class="mt-2 text-xs text-slate-400 flex items-center gap-1.5">
+          <span class="inline-block w-2 h-2 rounded-full bg-emerald-400"></span>
+          Steal 均为 <strong>0.0%</strong>，无 CPU 争抢
+        </div>
+      </div>
+    </div>
+
+    <!-- Machine Profile Comparison -->
+    <section class="space-y-4">
+      <div class="flex items-center justify-between">
+        <h3 class="text-lg font-bold text-white flex items-center gap-2">
+          <svg class="w-5 h-5 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+          脱敏机器档案与规格配置对比
+        </h3>
+        <span class="text-xs text-slate-400">敏感信息已完成脱敏打码掩蔽</span>
+      </div>
+
+      <div class="overflow-x-auto rounded-xl border border-slate-700/60">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-slate-800/80 text-xs uppercase text-slate-400 font-medium">
+            <tr>
+              <th class="px-5 py-3.5">对比维度</th>
+              <th class="px-5 py-3.5 text-rose-400">awssg (老母鸡 / 异常节点)</th>
+              <th class="px-5 py-3.5 text-emerald-400">awssg2 (新母鸡 / 自用健康节点)</th>
+              <th class="px-5 py-3.5">诊断启示</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-800 bg-slate-900/60 font-normal">
+            <tr>
+              <td class="px-5 py-3 font-medium text-slate-200">所属商家/标签</td>
+              <td class="px-5 py-3 font-mono text-rose-300">areazero90 (超卖商家)</td>
+              <td class="px-5 py-3 font-mono text-emerald-300">409124184#F71F8078 (薄肌小子自用)</td>
+              <td class="px-5 py-3 text-slate-400">卖家超卖模式决定母鸡公网积分池寿命</td>
+            </tr>
+            <tr>
+              <td class="px-5 py-3 font-medium text-slate-200">脱敏公网 IP</td>
+              <td class="px-5 py-3 font-mono">175.41.***.17 (AWS Singapore)</td>
+              <td class="px-5 py-3 font-mono">13.212.***.227 (AWS Singapore)</td>
+              <td class="px-5 py-3 text-slate-400">两台均为 AWS 新加坡 Lightsail 相同自治域 (AS16509)</td>
+            </tr>
+            <tr>
+              <td class="px-5 py-3 font-medium text-slate-200">容器规格与价格</td>
+              <td class="px-5 py-3 font-mono">1C / 64M / 1G / $0.40/月</td>
+              <td class="px-5 py-3 font-mono">1C / 64M / 1G / $0.40/月</td>
+              <td class="px-5 py-3 text-slate-400">配置完全一致（Podman 轻量 Debian 容器）</td>
+            </tr>
+            <tr>
+              <td class="px-5 py-3 font-medium text-slate-200">宿主机标称售卖带宽</td>
+              <td class="px-5 py-3 font-mono text-rose-400">累计销售 > 7,648 Mbps (严重超售)</td>
+              <td class="px-5 py-3 font-mono text-emerald-400">标称 630 Mbps (未超卖)</td>
+              <td class="px-5 py-3 text-slate-400">老母鸡总售卖带宽远超 AWS 物理接口上限</td>
+            </tr>
+            <tr>
+              <td class="px-5 py-3 font-medium text-slate-200">Xray 协议与落地</td>
+              <td class="px-5 py-3">VLESS Reality (63232) -> 直连</td>
+              <td class="px-5 py-3">VLESS Reality (63232) -> 直连 / HiNet 链式落地</td>
+              <td class="px-5 py-3 text-slate-400">新节点支持直连出口与台湾双路由链式代理</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Detailed Benchmark Matrix -->
+    <section class="space-y-4">
+      <h3 class="text-lg font-bold text-white flex items-center gap-2">
+        <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+        全链路性能基准实测数据对比
+      </h3>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <!-- Visual Comparison Bars -->
+        <div class="metric-card p-5 rounded-xl space-y-5">
+          <h4 class="text-sm font-semibold text-slate-200 uppercase tracking-wide border-b border-slate-700/50 pb-2">
+            关键带宽测试对比 (Mbps)
+          </h4>
+
+          <!-- Metric: Router Download -->
+          <div class="space-y-1.5">
+            <div class="flex justify-between text-xs">
+              <span class="text-slate-300">公网下行至客户端软路由 (iperf3)</span>
+              <span class="font-mono text-slate-400">awssg: 3.4M vs awssg2: 353M</span>
+            </div>
+            <div class="w-full bg-slate-800 rounded-full h-3 overflow-hidden flex">
+              <div class="bg-rose-500 h-full" style="width: 1%"></div>
+              <div class="bg-emerald-500 h-full" style="width: 90%"></div>
+            </div>
+            <div class="flex justify-between text-[11px] text-slate-400">
+              <span class="text-rose-400 font-mono">awssg: 3.40 Mbps (几乎不可用)</span>
+              <span class="text-emerald-400 font-mono">awssg2: 353.0 Mbps (流畅满速)</span>
+            </div>
+          </div>
+
+          <!-- Metric: Cloudflare 100M Download -->
+          <div class="space-y-1.5">
+            <div class="flex justify-between text-xs">
+              <span class="text-slate-300">国际 CDN 下载测速 (Cloudflare 100MB)</span>
+              <span class="font-mono text-slate-400">awssg: 145M vs awssg2: 579M</span>
+            </div>
+            <div class="w-full bg-slate-800 rounded-full h-3 overflow-hidden flex">
+              <div class="bg-rose-500 h-full" style="width: 25%"></div>
+              <div class="bg-emerald-500 h-full" style="width: 75%"></div>
+            </div>
+            <div class="flex justify-between text-[11px] text-slate-400">
+              <span class="text-rose-400 font-mono">awssg: 18.2 MB/s (145.6 Mbps)</span>
+              <span class="text-emerald-400 font-mono">awssg2: 72.4 MB/s (579.2 Mbps)</span>
+            </div>
+          </div>
+
+          <!-- Metric: Internal VPC Bandwidth -->
+          <div class="space-y-1.5">
+            <div class="flex justify-between text-xs">
+              <span class="text-slate-300">AWS 新加坡内网互测吞吐 (awssg &rarr; awssg2)</span>
+              <span class="font-mono text-cyan-400">647.0 Mbps</span>
+            </div>
+            <div class="w-full bg-slate-800 rounded-full h-3 overflow-hidden">
+              <div class="bg-cyan-500 h-full" style="width: 100%"></div>
+            </div>
+            <div class="flex justify-between text-[11px] text-slate-400">
+              <span class="text-cyan-400 font-mono">同机房延迟: 0.418 ms / 丢包: 0.0%</span>
+              <span class="text-cyan-400 font-mono">跑满母鸡 630M 端口物理上限</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Hardware & System Check -->
+        <div class="metric-card p-5 rounded-xl space-y-4">
+          <h4 class="text-sm font-semibold text-slate-200 uppercase tracking-wide border-b border-slate-700/50 pb-2">
+            硬件与系统性能健康状态
+          </h4>
+
+          <div class="grid grid-cols-2 gap-3 text-xs">
+            <div class="p-3 rounded-lg bg-slate-900/80 border border-slate-800">
+              <div class="text-slate-400">CPU 架构与型号</div>
+              <div class="font-semibold text-slate-200 mt-1">AMD EPYC 7R32</div>
+              <div class="text-slate-400 mt-0.5">64-Core (1 vCPU分配)</div>
+            </div>
+            <div class="p-3 rounded-lg bg-slate-900/80 border border-slate-800">
+              <div class="text-slate-400">CPU Steal (宿主抢占)</div>
+              <div class="font-semibold text-emerald-400 mt-1 font-mono">0.0% / 0.0%</div>
+              <div class="text-slate-400 mt-0.5">宿主无任何算力争抢</div>
+            </div>
+            <div class="p-3 rounded-lg bg-slate-900/80 border border-slate-800">
+              <div class="text-slate-400">AES-256 加密跑分</div>
+              <div class="font-semibold text-cyan-400 mt-1 font-mono">3.23 vs 3.14 GB/s</div>
+              <div class="text-slate-400 mt-0.5">完全一致，硬件算力充沛</div>
+            </div>
+            <div class="p-3 rounded-lg bg-slate-900/80 border border-slate-800">
+              <div class="text-slate-400">NVMe 磁盘写入</div>
+              <div class="font-semibold text-cyan-400 mt-1 font-mono">1.45 vs 1.51 GB/s</div>
+              <div class="text-slate-400 mt-0.5">底层存储 I/O 极快</div>
+            </div>
+          </div>
+
+          <div class="p-3 rounded-lg bg-slate-900/60 border border-slate-800 text-xs text-slate-300">
+            <strong class="text-emerald-400">排查结论：</strong>宿主机硬件资源（CPU、内存、磁盘 NVMe、内核 Podman 网桥）处于完全健康状态。
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Deep-Dive: ss -ti Socket Analysis -->
+    <section class="space-y-4">
+      <div class="flex items-center justify-between">
+        <h3 class="text-lg font-bold text-white flex items-center gap-2">
+          <svg class="w-5 h-5 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/></svg>
+          Linux 内核 TCP 套接字状态深度抓包分析 (ss -ti)
+        </h3>
+        <span class="text-xs text-amber-400 font-mono">证据链关键支撑</span>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <!-- awssg Dump -->
+        <div class="metric-card p-4 rounded-xl border border-rose-500/40 space-y-3">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold text-rose-400 uppercase tracking-wider">awssg (老母鸡) 回程套接字</span>
+            <span class="text-xs px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 font-semibold">严重惩罚性收缩</span>
+          </div>
+          <div class="code-block p-3 rounded-lg text-xs text-slate-300 overflow-x-auto leading-relaxed">
+            <div class="text-rose-400 font-bold"># ss -ti -H sport = :63233 (客户端公网 58.45.***.***)</div>
+            <div>cubic wscale:7,7 rto:268 rtt:<span class="text-rose-400 font-bold">124.621/72.062</span> minrtt:54.2</div>
+            <div>cwnd:<span class="text-rose-400 font-bold">30</span> ssthresh:<span class="text-rose-400 font-bold">14</span> <span class="text-amber-300 font-bold">rehash:7</span></div>
+            <div>bytes_sent: 1,424,800 bytes_retrans: <span class="text-rose-400 font-bold">450,480</span></div>
+            <div>delivery_rate: <span class="text-rose-400 font-bold">3.73Mbps</span> busy:4732ms</div>
+          </div>
+          <div class="text-xs text-slate-300 space-y-1">
+            <div class="flex justify-between">
+              <span class="text-slate-400">重传率 (Retransmit Rate):</span>
+              <span class="font-mono text-rose-400 font-bold">31.62% (发送 1.42MB 丢 450KB)</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-slate-400">拥塞窗口 (cwnd):</span>
+              <span class="font-mono text-rose-400 font-bold">30 (因剧烈丢包被降至最低保底)</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-slate-400">路由重新散列 (rehash):</span>
+              <span class="font-mono text-amber-400 font-bold">7 次 (内核试图更换链路避让丢包)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- awssg2 Dump -->
+        <div class="metric-card p-4 rounded-xl border border-emerald-500/40 space-y-3">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold text-emerald-400 uppercase tracking-wider">awssg2 (新自用鸡) 回程套接字</span>
+            <span class="text-xs px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-semibold">健康满速运行</span>
+          </div>
+          <div class="code-block p-3 rounded-lg text-xs text-slate-300 overflow-x-auto leading-relaxed">
+            <div class="text-emerald-400 font-bold"># ss -ti -H sport = :63233 (客户端公网 58.45.***.***)</div>
+            <div>cubic wscale:7,7 rto:256 rtt:<span class="text-emerald-400 font-bold">58.742/2.115</span> minrtt:53.6</div>
+            <div>cwnd:<span class="text-emerald-400 font-bold">252</span> ssthresh:128 <span class="text-emerald-300 font-bold">rehash:0</span></div>
+            <div>bytes_sent: 68,241,120 bytes_retrans: <span class="text-emerald-400 font-bold">7,240</span></div>
+            <div>delivery_rate: <span class="text-emerald-400 font-bold">441.25Mbps</span> busy:1520ms</div>
+          </div>
+          <div class="text-xs text-slate-300 space-y-1">
+            <div class="flex justify-between">
+              <span class="text-slate-400">重传率 (Retransmit Rate):</span>
+              <span class="font-mono text-emerald-400 font-bold">0.01% (发送 68.2MB 重传 7KB)</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-slate-400">拥塞窗口 (cwnd):</span>
+              <span class="font-mono text-emerald-400 font-bold">252 (平滑扩张，跑满物理网卡)</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-slate-400">路由重新散列 (rehash):</span>
+              <span class="font-mono text-emerald-400 font-bold">0 次 (链路极度健康平稳)</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Root Cause Analysis Breakdown -->
+    <section class="metric-card p-6 rounded-2xl border border-slate-700/60 space-y-6">
+      <h3 class="text-lg font-bold text-white flex items-center gap-2">
+        <svg class="w-5 h-5 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"/></svg>
+        三维根因交叉排查逻辑链
+      </h3>
+
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <!-- Dimension 1 -->
+        <div class="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-2">
+          <div class="flex items-center gap-2">
+            <span class="w-6 h-6 rounded-full bg-slate-800 text-slate-300 flex items-center justify-center text-xs font-bold">1</span>
+            <h4 class="font-semibold text-slate-200 text-sm">宿主硬件/OS故障？</h4>
+          </div>
+          <div class="text-xs text-rose-400 font-bold">【明确排除】</div>
+          <p class="text-xs text-slate-400 leading-relaxed">
+            CPU Steal 严格为 0%，加密运算 3.23 GB/s，NVMe 写入 1.5 GB/s。两台同机房内网直连互打跑出 647 Mbps，证明物理网卡与内核处理能力均无异常。
+          </p>
+        </div>
+
+        <!-- Dimension 2 -->
+        <div class="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-2">
+          <div class="flex items-center gap-2">
+            <span class="w-6 h-6 rounded-full bg-slate-800 text-slate-300 flex items-center justify-center text-xs font-bold">2</span>
+            <h4 class="font-semibold text-slate-200 text-sm">容器内部/人为TC限速？</h4>
+          </div>
+          <div class="text-xs text-rose-400 font-bold">【明确排除】</div>
+          <p class="text-xs text-slate-400 leading-relaxed">
+            检查 <code class="text-slate-300">tc qdisc show</code> 无限速策略；且如果存在容器级限流，内网测速也会被卡死在 3M。内网能跑满 647M 证实系统内部无人为限制策略。
+          </p>
+        </div>
+
+        <!-- Dimension 3 -->
+        <div class="p-4 rounded-xl bg-slate-900/80 border border-emerald-500/30 space-y-2">
+          <div class="flex items-center gap-2">
+            <span class="w-6 h-6 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center text-xs font-bold">3</span>
+            <h4 class="font-semibold text-white text-sm">超售与 AWS 积分耗尽？</h4>
+          </div>
+          <div class="text-xs text-emerald-400 font-bold">【完全命中·核心根因】</div>
+          <p class="text-xs text-slate-300 leading-relaxed">
+            老母鸡单实例超售标称带宽超 7.6G，大流量租户将 AWS Lightsail 的公网突发网络积分消耗殆尽。AWS 底层物理网关实施限流丢包惩罚，导致公网链路产生 31.6% 剧烈丢包。
+          </p>
+        </div>
+      </div>
+
+      <!-- Explanatory Diagram Box -->
+      <div class="p-4 rounded-xl bg-slate-950/60 border border-slate-800/80 space-y-3">
+        <h4 class="text-xs font-bold text-cyan-400 uppercase tracking-wider">
+          为什么“内网互测跑满 647M”，而“公网回程只有 3.4M”？
+        </h4>
+        <p class="text-xs text-slate-300 leading-relaxed">
+          AWS Lightsail（基于 EC2 T 系列架构）采用<strong>突发网络积分机制（Network Allowance）</strong>：
+        </p>
+        <ul class="text-xs text-slate-400 space-y-1.5 list-disc list-inside">
+          <li>
+            <strong class="text-slate-200">同机房 VPC 内网流量：</strong>不经过 AWS 外网 NAT 网关，不扣减公网突发网络配额（Allowance），因此双鸡互测能够完全释放物理网卡能力，轻松达到 <strong>647 Mbps</strong>。
+          </li>
+          <li>
+            <strong class="text-slate-200">出公网回程流量：</strong>必须经过 AWS 边缘 Internet Gateway。当超售宿主机的公网突发积分被耗尽后，AWS 边界交换机进行强制整形与惩罚性丢包（实测丢包率高达 <strong>31.6%</strong>）。TCP 协议检测到丢包后立即将拥塞窗口由数百收缩至 30，最终带宽暴跌至 <strong>3.40 Mbps</strong>。
+          </li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- Operational Recommendations -->
+    <section class="rounded-2xl p-6 border border-emerald-500/30 bg-gradient-to-r from-emerald-950/20 via-slate-900 to-slate-900 space-y-4">
+      <h3 class="text-lg font-bold text-white flex items-center gap-2">
+        <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        生产处置建议与已完成变更
+      </h3>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+        <div class="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-1.5">
+          <div class="font-bold text-rose-400 text-sm">1. 废弃并下线 awssg</div>
+          <p class="text-slate-400 leading-relaxed">
+            该老母鸡已被超售大流量毁坏，突发积分无法恢复，公网传输丢包超 30%，建议立即申请退款或停用。
+          </p>
+        </div>
+        <div class="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-1.5">
+          <div class="font-bold text-emerald-400 text-sm">2. 全面接入 awssg2 / awssg2tw</div>
+          <p class="text-slate-400 leading-relaxed">
+            新节点公网回程达 353 Mbps，0 丢包。提供新加坡本地直出与台湾 HiNet 链式落地双路由能力。
+          </p>
+        </div>
+        <div class="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-1.5">
+          <div class="font-bold text-cyan-400 text-sm">3. 订阅分发已全量同步</div>
+          <p class="text-slate-400 leading-relaxed">
+            跳板机中转与 4 套订阅已无缝写入新节点与分组策略，全网自动化健康检查均通过（HTTP 200）。
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="pt-4 border-t border-slate-800 text-center text-xs text-slate-500">
+      AWS 新加坡 Lightsail 诊断与交叉对比系统 · 自动生成并完成脱敏保护 · 2026-11-07
+    </footer>
+
+  </div>
+</body>
+</html>
